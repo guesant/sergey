@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const fs = require('fs');
+const { JSDOM } = require('jsdom');
 const { performance } = require('perf_hooks');
 const marked = require('marked');
 require('dotenv').config();
@@ -51,15 +52,7 @@ const excludedFolders = [
 ];
 
 const patterns = {
-  whitespace: /^\s+|\s+$/g,
-  templates: /<sergey-template name="([a-zA-Z0-9-_.\\\/]*)">(.*?)<\/sergey-template>/gms,
-  complexNamedSlots: /<sergey-slot name="([a-zA-Z0-9-_.\\\/]*)">(.*?)<\/sergey-slot>/gms,
-  simpleNamedSlots: /<sergey-slot name="([a-zA-Z0-9-_.\\\/]*)"\s?\/>/gm,
-  complexDefaultSlots: /<sergey-slot>(.*?)<\/sergey-slot>/gms,
-  simpleDefaultSlots: /<sergey-slot\s?\/>/gm,
-  complexImports: /<sergey-import src="([a-zA-Z0-9-_.\\\/]*)"(?:\sas="(.*?)")?>(.*?)<\/sergey-import>/gms,
-  simpleImports: /<sergey-import src="([a-zA-Z0-9-_.\\\/]*)"(?:\sas="(.*?)")?\s?\/>/gm,
-  links: /<sergey-link\s?(.*?)(?:to|href)="([a-zA-Z0-9-_.#?\\\/]*)"\s?(.*?)>(.*?)<\/sergey-link>/gms
+  whitespace: /^\s+|\s+$/g
 };
 
 /**
@@ -183,6 +176,22 @@ const getFilesToWatch = path => {
 /**
  * Helpers
  */
+const getDom = content => new JSDOM(content);
+const prepareHTML = html => {
+  let newHtml = html;
+
+  (newHtml.match(/<[^<]+\/>/g) || []).forEach(i => {
+    let newTagContent = i.slice(1, -2).trim();
+
+    const tagName = newTagContent.split(' ')[0];
+    newTagContent = `<${newTagContent}></${tagName}>`;
+
+    newHtml = newHtml.replace(i, newTagContent);
+  });
+
+  return newHtml;
+};
+
 const formatContent = x => x.replace(patterns.whitespace, '');
 const getKey = (key, ext = '.html', folder = '') => {
   const file = key.endsWith(ext) ? key : `${key}${ext}`;
@@ -219,13 +228,15 @@ const getSlots = content => {
     default: formatContent(content) || ''
   };
 
-  // Search content for templates
-  while ((m = patterns.templates.exec(content)) !== null) {
-    if (m.index === patterns.templates.lastIndex) {
-      patterns.templates.lastIndex++;
-    }
+  const dom = getDom(content);
+  const items = dom.window.document.querySelectorAll('sergey-template');
 
-    const [find, name, data] = m;
+  // Search content for templates
+  items.forEach(i => {
+    const find = i.outerHTML;
+    const name = i.getAttribute('name') || '';
+    const data = i.innerHTML;
+
     if (name !== 'default') {
       // Remove it from the default content
       slots.default = slots.default.replace(find, '');
@@ -233,66 +244,40 @@ const getSlots = content => {
 
     // Add it as a named slot
     slots[name] = formatContent(data);
-  }
+  });
 
   slots.default = formatContent(slots.default);
 
   return slots;
 };
 
-const compileSlots = (body, slots) => {
-  let m;
-  let copy;
+const compileSlots = (body_, slots) => {
+  let body = body_;
 
-  // Complex named slots
-  copy = body;
-  while ((m = patterns.complexNamedSlots.exec(body)) !== null) {
-    if (m.index === patterns.complexNamedSlots.lastIndex) {
-      patterns.complexNamedSlots.lastIndex++;
-    }
+  const dom = getDom(body);
+  const items = dom.window.document.querySelectorAll('sergey-slot');
 
-    const [find, name, fallback] = m;
-    copy = copy.replace(find, slots[name] || fallback || '');
-  }
-  body = copy;
+  items.forEach(i => {
+    const find = i.outerHTML;
+    const name = i.getAttribute('name') || 'default';
+    const fallback = i.innerHTML;
 
-  // Simple named slots
-  while ((m = patterns.simpleNamedSlots.exec(body)) !== null) {
-    if (m.index === patterns.simpleNamedSlots.lastIndex) {
-      patterns.simpleNamedSlots.lastIndex++;
-    }
-
-    const [find, name] = m;
-    copy = copy.replace(find, slots[name] || '');
-  }
-  body = copy;
-
-  // Complex Default slots
-  while ((m = patterns.complexDefaultSlots.exec(body)) !== null) {
-    if (m.index === patterns.complexDefaultSlots.lastIndex) {
-      patterns.complexDefaultSlots.lastIndex++;
-    }
-
-    const [find, fallback] = m;
-    copy = copy.replace(find, slots.default || fallback || '');
-  }
-  body = copy;
-
-  // Simple default slots
-  body = body.replace(patterns.simpleDefaultSlots, slots.default);
-
+    body = body.replace(find, slots[name] || fallback || '');
+  });
   return body;
 };
 
 const compileImport = (body, pattern) => {
-  let m;
   // Simple imports
-  while ((m = pattern.exec(body)) !== null) {
-    if (m.index === pattern.lastIndex) {
-      pattern.lastIndex++;
-    }
+  const dom = getDom(body);
+  const items = dom.window.document.querySelectorAll(pattern);
 
-    let [find, key, htmlAs = '', content = ''] = m;
+  items.forEach(i => {
+    let find = i.outerHTML;
+    let key = i.getAttribute('src');
+    let htmlAs = i.getAttribute('as') || '';
+    let content = i.innerHTML || '';
+
     let replace = '';
 
     if (htmlAs === 'markdown') {
@@ -308,26 +293,25 @@ const compileImport = (body, pattern) => {
     // Recurse
     replace = compileTemplate(replace, slots);
     body = body.replace(find, replace);
-  }
+  });
 
   return body;
 };
 
-const compileTemplate = (body, slots = { default: '' }) => {
+const compileTemplate = (fileContent, slots = { default: '' }) => {
+  let body = prepareHTML(fileContent);
   body = compileSlots(body, slots);
 
   if (!hasImports(body)) {
     return body;
   }
 
-  body = compileImport(body, patterns.simpleImports);
-  body = compileImport(body, patterns.complexImports);
+  body = compileImport(body, 'sergey-import');
 
   return body;
 };
 
 const compileLinks = (body, path) => {
-  let m;
   let copy;
 
   if (!hasLinks(body)) {
@@ -335,34 +319,35 @@ const compileLinks = (body, path) => {
   }
 
   copy = body;
-  while ((m = patterns.links.exec(body)) !== null) {
-    if (m.index === patterns.links.lastIndex) {
-      patterns.links.lastIndex++;
-    }
+  const dom = getDom(body);
+  const items = dom.window.document.querySelectorAll('sergey-link');
 
-    let [find, attr1 = '', to, attr2 = '', content] = m;
+  items.forEach(i => {
     let replace = '';
-    let attributes = [`href="${to}"`, attr1, attr2]
-      .map(x => x.trim())
-      .filter(Boolean)
-      .join(' ');
+    let find = i.outerHTML;
+
+    const toAttr = ['to', 'href'].find(k => i.hasAttribute(k));
+    const to = i.getAttribute(toAttr) || '';
+
+    i.removeAttribute(toAttr);
 
     const isCurrent = isCurrentPage(to, path);
     if (isCurrent || isParentPage(to, path)) {
-      if (attributes.includes('class="')) {
-        attributes = attributes.replace('class="', `class="${ACTIVE_CLASS} `);
-      } else {
-        attributes += ` class="${ACTIVE_CLASS}"`;
-      }
+      const currClass = i.getAttribute('class') || '';
+      i.setAttribute('class', `${ACTIVE_CLASS} ${currClass.trimLeft()}`.trim());
 
       if (isCurrent) {
-        attributes += ' aria-current="page"';
+        i.setAttribute('aria-current', 'page');
       }
     }
 
-    replace = `<a ${attributes}>${content}</a>`;
+    replace = i.outerHTML
+      .replace(/^<sergey-link/, '<a')
+      .replace('</sergey-link>', '</a>')
+      .replace(/^<a/, `<a href="${to}"`);
+
     copy = copy.replace(find, replace);
-  }
+  });
   body = copy;
 
   return body;
