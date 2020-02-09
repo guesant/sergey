@@ -177,17 +177,44 @@ const getFilesToWatch = path => {
  * Helpers
  */
 const getDom = content => new JSDOM(content);
+
+// https://html.spec.whatwg.org/multipage/syntax.html#void-elements
+const VOID_ELEMENTS = [
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr'
+];
+
+
+// `<sergey-slot ...args />` -> `<sergey-slot ...args></sergey-slot>`
+// the function ignores void elements like `<img />`
 const prepareHTML = html => {
   let newHtml = html;
 
-  (newHtml.match(/<[^<]+\/>/g) || []).forEach(i => {
-    let newTagContent = i.slice(1, -2).trim();
+  (newHtml.match(/<[^<|\/>]+\/>/g) || [])
+    .map(original => {
+      const def = original.slice(1, -2).trim();
+      const tagName = def.split(' ')[0].trim();
 
-    const tagName = newTagContent.split(' ')[0];
-    newTagContent = `<${newTagContent}></${tagName}>`;
-
-    newHtml = newHtml.replace(i, newTagContent);
-  });
+      return { original, def, tagName };
+    })
+    .filter(({ tagName }) => !VOID_ELEMENTS.includes(tagName))
+    .forEach(({ original, def, tagName }) => {
+      let newTagContent = def;
+      newTagContent = `<${newTagContent}></${tagName}>`;
+      newHtml = newHtml.replace(original, newTagContent);
+    });
 
   return newHtml;
 };
@@ -222,6 +249,40 @@ const primeImport = (path, body) => {
   cachedImports[path] = body;
 };
 
+const tagChange = ({ body: argBody, selector }, fn) => {
+  let body = argBody;
+
+  const changeItem = i => fn(i);
+  const changeItemsByHTML = html => {
+    const dom = getDom(html || body);
+    const items = dom.window.document.querySelectorAll(selector);
+
+    items.forEach(i => {
+      const find = i.outerHTML;
+      body = body.replace(find, changeItem(i, find));
+    });
+  };
+  changeItemsByHTML();
+
+  // bug-fix for tags inside tags
+  // <meta foo="<sergey-slot></sergey-slot>">
+  if (body.includes(`</${selector}>`)) {
+    const regexpRangeTag = selector.replace('-', '\\-');
+
+    const remaingTags =
+      body.match(
+        new RegExp(
+          `<${selector}[^<]*>[^<${regexpRangeTag}]*<\\/sergey-slot>`,
+          'g'
+        )
+      ) || [];
+
+    changeItemsByHTML(remaingTags.join(''));
+  }
+
+  return body;
+};
+
 const getSlots = content => {
   // Extract templates first
   const slots = {
@@ -251,34 +312,28 @@ const getSlots = content => {
   return slots;
 };
 
-const compileSlots = (body_, slots) => {
-  let body = body_;
+const compileSlots = (argBody, slots) => {
+  let body = argBody;
 
-  const dom = getDom(body);
-  const items = dom.window.document.querySelectorAll('sergey-slot');
-
-  items.forEach(i => {
-    const find = i.outerHTML;
+  body = tagChange({ body, selector: 'sergey-slot' }, i => {
     const name = i.getAttribute('name') || 'default';
     const fallback = i.innerHTML;
 
-    body = body.replace(find, slots[name] || fallback || '');
+    return slots[name] || fallback || '';
   });
+
   return body;
 };
 
-const compileImport = (body, pattern) => {
-  // Simple imports
-  const dom = getDom(body);
-  const items = dom.window.document.querySelectorAll(pattern);
+const compileImport = (argBody, pattern) => {
+  let body = argBody;
 
-  items.forEach(i => {
-    let find = i.outerHTML;
+  body = tagChange({ body, selector: pattern }, i => {
+    let replace = '';
+
     let key = i.getAttribute('src');
     let htmlAs = i.getAttribute('as') || '';
     let content = i.innerHTML || '';
-
-    let replace = '';
 
     if (htmlAs === 'markdown') {
       replace = formatContent(
@@ -292,7 +347,7 @@ const compileImport = (body, pattern) => {
 
     // Recurse
     replace = compileTemplate(replace, slots);
-    body = body.replace(find, replace);
+    return replace;
   });
 
   return body;
@@ -311,24 +366,16 @@ const compileTemplate = (fileContent, slots = { default: '' }) => {
   return body;
 };
 
-const compileLinks = (body, path) => {
-  let copy;
+const compileLinks = (argBody, path) => {
+  let body = argBody;
 
   if (!hasLinks(body)) {
     return body;
   }
 
-  copy = body;
-  const dom = getDom(body);
-  const items = dom.window.document.querySelectorAll('sergey-link');
-
-  items.forEach(i => {
-    let replace = '';
-    let find = i.outerHTML;
-
+  body = tagChange({ body, selector: 'sergey-link' }, i => {
     const toAttr = ['to', 'href'].find(k => i.hasAttribute(k));
     const to = i.getAttribute(toAttr) || '';
-
     i.removeAttribute(toAttr);
 
     const isCurrent = isCurrentPage(to, path);
@@ -341,14 +388,11 @@ const compileLinks = (body, path) => {
       }
     }
 
-    replace = i.outerHTML
+    return i.outerHTML
       .replace(/^<sergey-link/, '<a')
       .replace('</sergey-link>', '</a>')
       .replace(/^<a/, `<a href="${to}"`);
-
-    copy = copy.replace(find, replace);
   });
-  body = copy;
 
   return body;
 };
