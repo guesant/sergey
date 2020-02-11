@@ -25,6 +25,8 @@
   "dependencies": {
     "chokidar": "^2.1.5",
     "connect": "^3.6.6",
+    "css": "^2.2.4",
+    "cuid": "^2.1.8",
     "dotenv": "^7.0.0",
     "jsdom": "^16.1.0",
     "marked": "^0.8.0",

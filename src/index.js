@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 const fs = require('fs');
+const cuid = require('cuid');
 const { JSDOM } = require('jsdom');
+const { parse: cssParse, stringify: cssStringify } = require('css');
 const { performance } = require('perf_hooks');
 const marked = require('marked');
 require('dotenv').config();
@@ -196,11 +198,11 @@ const VOID_ELEMENTS = [
   'wbr'
 ];
 
-
 // `<sergey-slot ...args />` -> `<sergey-slot ...args></sergey-slot>`
 // the function ignores void elements like `<img />`
 const prepareHTML = html => {
-  let newHtml = html;
+  let newHtml = html || '';
+  if (!newHtml.trim()) return newHtml;
 
   (newHtml.match(/<[^<|\/>]+\/>/g) || [])
     .map(original => {
@@ -209,14 +211,50 @@ const prepareHTML = html => {
 
       return { original, def, tagName };
     })
-    .filter(({ tagName }) => !VOID_ELEMENTS.includes(tagName))
     .forEach(({ original, def, tagName }) => {
       let newTagContent = def;
-      newTagContent = `<${newTagContent}></${tagName}>`;
+
+      newTagContent = VOID_ELEMENTS.includes(tagName)
+        ? `<${newTagContent.replace(/[\r|\n]/g, '')}>`
+        : `<${newTagContent}></${tagName}>`;
+
       newHtml = newHtml.replace(original, newTagContent);
     });
 
-  return newHtml;
+  const dom = getDom(newHtml);
+  const { document } = dom.window;
+
+  if (newHtml.includes('</html>') || newHtml.includes('<!DOCTYPE html>')) {
+    const bodySpacing = (newHtml.match(/(\s*)<body>/) || [])[1] || '';
+
+    const serialize = dom.serialize();
+    return serialize
+      .replace('<head></head>', bodySpacing)
+      .replace(/\s*<\/body><\/html>/, `${bodySpacing}</body>\n</html>`);
+  }
+
+  /* has head */
+  if (document.head.childNodes.length) {
+    /* has body */
+    if (document.body.childNodes.length) {
+      if (!newHtml.includes('</head>') || !newHtml.includes('</body>')) {
+        return `${document.head.innerHTML}${document.body.innerHTML}`;
+      }
+      return dom.serialize();
+    } else {
+      if (newHtml.includes('</head>')) {
+        return document.head.outerHTML;
+      } else {
+        return document.head.innerHTML;
+      }
+    }
+  }
+
+  /* has body. no head */
+  if (newHtml.includes('</body>') || newHtml.includes('<body ')) {
+    return document.body.outerHTML;
+  }
+  return document.body.innerHTML;
 };
 
 const formatContent = x => x.replace(patterns.whitespace, '');
@@ -246,10 +284,54 @@ const prepareImports = async folder => {
 };
 
 const primeImport = (path, body) => {
-  cachedImports[path] = body;
+  cachedImports[path] = path.endsWith('.html')
+    ? scopeStyle(prepareHTML(body), [])
+    : body;
 };
 
-const tagChange = ({ body: argBody, selector }, fn) => {
+const clearAutotags = argBody => {
+  let body = prepareHTML(argBody);
+
+  body = tagChange({ body, selector: '[data-sergey-autotag]' }, i => {
+    i.removeAttribute('data-sergey-autotag');
+
+    if (i.attributes.length === 0) {
+      return i.innerHTML;
+    }
+    return i.outerHTML;
+  });
+
+  return body;
+};
+
+const postSergey = argBody => {
+  let body = argBody;
+  body = clearAutotags(body);
+
+  let stylesheet = [];
+  body = tagChange({ body, selector: 'style' }, i => {
+    stylesheet.push(i.innerHTML);
+    return '';
+  });
+
+  const dom = getDom(body);
+  const style = dom.window.document.createElement('style');
+  style.setAttribute('lang', 'text/css');
+
+  stylesheet.reverse();
+  style.innerHTML = stylesheet.join('\n');
+
+  if (body.includes('</head>')) {
+    dom.window.document.head.append(style);
+    body = dom.serialize();
+  } else {
+    body += style.outerHTML;
+  }
+
+  return body;
+};
+
+const tagChange = ({ body: argBody, selector, mode = 'outerHTML' }, fn) => {
   let body = argBody;
 
   const changeItem = i => fn(i);
@@ -258,8 +340,9 @@ const tagChange = ({ body: argBody, selector }, fn) => {
     const items = dom.window.document.querySelectorAll(selector);
 
     items.forEach(i => {
-      const find = i.outerHTML;
-      body = body.replace(find, changeItem(i, find));
+      const find = i[mode];
+      const newc = changeItem(i, find);
+      body = body.replace(find, newc);
     });
   };
   changeItemsByHTML();
@@ -312,23 +395,113 @@ const getSlots = content => {
   return slots;
 };
 
-const compileSlots = (argBody, slots) => {
+const applyClasses = (
+  argBody,
+  scopedClasses = [],
+  strictClasses = [],
+  query = 'body > [data-sergey-autotag]'
+) => {
+  if (scopedClasses.length === 0 && strictClasses.length === 0) return argBody;
+  let body = argBody;
+
+  const dom = getDom(body);
+  const el = dom.window.document.querySelector('[data-sergey-autotag]');
+  el.innerHTML = '';
+
+  const elBefore = el.outerHTML.slice(0, -1 * '</div>'.length);
+  scopedClasses.forEach(_class => {
+    el.setAttribute(`data-sergey-scope-${_class}`, '');
+  });
+  const elAfter = el.outerHTML.slice(0, -1 * '</div>'.length);
+  body = body.replace(elBefore, elAfter);
+
+  body = tagChange({ body, selector: 'body *:not(style)' }, i => {
+    strictClasses.forEach(_class => {
+      i.setAttribute(`data-sergey-strict-${_class}`, '');
+    });
+
+    return i.outerHTML;
+  });
+
+  return body;
+};
+
+const applySelectorScope = (selector, scope, strict) => {
+  if (!strict) {
+    return `[data-sergey-scope-${scope}] ${selector}`;
+  }
+
+  const prefix = selector.slice(0, selector.indexOf(':'));
+  const postfix = selector.slice(selector.indexOf(':'));
+
+  return `${prefix}[data-sergey-strict-${scope}]${postfix}`;
+};
+
+const scopeStyle = (argBody, scopedClasses) => {
+  let body = argBody;
+  const strictClasses = [];
+
+  body = tagChange(
+    { body, selector: 'style[sergey-scoped]', mode: 'innerHTML' },
+    i => {
+      const strict = i.getAttribute('sergey-scoped') === 'strict';
+      const scope = cuid.slug();
+      if (strict) {
+        strictClasses.push(scope);
+      } else {
+        scopedClasses.push(scope);
+      }
+
+      if (strictClasses.length === 0 && scopedClasses.length === 0) {
+        return i.innerHTML;
+      }
+
+      const scopedStyle = cssParse(i.innerHTML);
+      scopedStyle.stylesheet.rules = scopedStyle.stylesheet.rules.map(rule => {
+        if (rule.type !== 'rule') return rule;
+
+        rule.selectors = rule.selectors.map(selector => {
+          return selector.includes('sergey-ignore')
+            ? selector.replace('sergey-ignore', '').trim()
+            : applySelectorScope(selector, scope, strict);
+        });
+        return rule;
+      });
+
+      return cssStringify(scopedStyle);
+    }
+  );
+
+  body = tagChange({ body, selector: 'style[sergey-scoped]' }, i => {
+    i.removeAttribute('sergey-scoped');
+    return i.outerHTML;
+  });
+
+  const dom = getDom(body);
+  if (!dom.window.document.querySelector('body > [data-sergey-autotag]')) {
+    body = `<div data-sergey-autotag="">${body}</div>`;
+  }
+  body = applyClasses(body, scopedClasses, strictClasses);
+  return body;
+};
+
+const compileSlots = (argBody, slots, classes = []) => {
   let body = argBody;
 
   body = tagChange({ body, selector: 'sergey-slot' }, i => {
     const name = i.getAttribute('name') || 'default';
     const fallback = i.innerHTML;
 
-    return slots[name] || fallback || '';
+    return applyClasses(slots[name] || fallback || '', classes);
   });
 
   return body;
 };
 
-const compileImport = (argBody, pattern) => {
+const compileImport = (argBody, parentClasses = []) => {
   let body = argBody;
 
-  body = tagChange({ body, selector: pattern }, i => {
+  body = tagChange({ body, selector: 'sergey-import' }, i => {
     let replace = '';
 
     let key = i.getAttribute('src');
@@ -344,26 +517,28 @@ const compileImport = (argBody, pattern) => {
     }
 
     const slots = getSlots(content);
-
-    // Recurse
-    replace = compileTemplate(replace, slots);
+    replace = scopeStyle(replace, parentClasses);
+    replace = compileTemplate(replace, slots, parentClasses); // recurse
     return replace;
   });
 
   return body;
 };
 
-const compileTemplate = (fileContent, slots = { default: '' }) => {
+const compileTemplate = (
+  fileContent,
+  slots = { default: '' },
+  classes = []
+) => {
   let body = prepareHTML(fileContent);
-  body = compileSlots(body, slots);
+  body = compileSlots(body, slots, classes);
 
   if (!hasImports(body)) {
     return body;
   }
 
-  body = compileImport(body, 'sergey-import');
-
-  return body;
+  body = compileImport(body, classes);
+  return clearAutotags(body);
 };
 
 const compileLinks = (argBody, path) => {
@@ -425,6 +600,7 @@ const compileFolder = async (localFolder, localPublicFolder) => {
               return readFile(fullFilePath)
                 .then(compileTemplate)
                 .then(body => compileLinks(body, fullLocalFilePath))
+                .then(body => postSergey(body))
                 .then(body => writeFile(fullPublicFilePath, body));
             }
 

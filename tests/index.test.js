@@ -18,7 +18,7 @@ const header = (x = '') => `<header>
 </header>`;
 
 const footer = () => `<footer>
-  &copy; 2019
+  © 2019
 </footer>`;
 
 const testImport = file => `${IMPORTS}${file}`;
@@ -322,7 +322,7 @@ Content is **great**.`
     );
     const desiredOutput = `<h1 id="example-code-block">Example code block</h1>
 <pre><code class="language-html">&lt;article&gt;
-  &lt;sergey-import src=&quot;code&quot; as=&quot;markdown&quot; /&gt;
+  &lt;sergey-import src="code" as="markdown" /&gt;
 &lt;/article&gt;</code></pre>`;
 
     const output = compileTemplate(
